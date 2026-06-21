@@ -3,9 +3,11 @@ const path = require("path");
 const fs = require("fs");
 const { fork } = require("child_process");
 const { getWindows } = require("./window-utils");
+const { diffLines, formatDiffForMarkdown } = require("./diff-utils");
 
 const MAX_RESTART_ATTEMPTS = 5;
 const RESET_RESTART_DELAY = 30000;
+const SNAPSHOT_INTERVAL = 5 * 60 * 1000;
 
 let mainWindow = null;
 let workerProcess = null;
@@ -14,7 +16,19 @@ let currentWindowHandle = null;
 let restartCount = 0;
 let lastRestartTime = 0;
 let restartTimer = null;
+let snapshotTimer = null;
+let lastSnapshotTime = 0;
 let mdFilePath = path.join(app.getPath("desktop"), "ocr-output.md");
+let lastOcrText = "";
+
+function getScreenshotsDir() {
+  const mdDir = path.dirname(mdFilePath);
+  const dir = path.join(mdDir, "screenshots");
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -38,6 +52,78 @@ function createWindow() {
   });
 }
 
+function requestSnapshot() {
+  if (workerProcess && isCapturing) {
+    workerProcess.send({ type: "snapshot" });
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("status-change", { status: "snapshot", message: "正在保存快照..." });
+    }
+  }
+}
+
+function startSnapshotTimer() {
+  stopSnapshotTimer();
+  lastSnapshotTime = Date.now();
+  snapshotTimer = setInterval(() => {
+    if (isCapturing) {
+      requestSnapshot();
+    }
+  }, SNAPSHOT_INTERVAL);
+}
+
+function stopSnapshotTimer() {
+  if (snapshotTimer) {
+    clearInterval(snapshotTimer);
+    snapshotTimer = null;
+  }
+  lastSnapshotTime = 0;
+}
+
+function getNextSnapshotTime() {
+  if (!snapshotTimer || lastSnapshotTime === 0) return null;
+  return lastSnapshotTime + SNAPSHOT_INTERVAL;
+}
+
+function saveSnapshot(base64Buffer, timestamp) {
+  try {
+    const buffer = Buffer.from(base64Buffer, "base64");
+    const dir = getScreenshotsDir();
+    const dateStr = new Date(timestamp).toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `snapshot_${dateStr}.png`;
+    const fullPath = path.join(dir, filename);
+
+    fs.writeFileSync(fullPath, buffer);
+
+    const mdDir = path.dirname(mdFilePath);
+    const relPath = path.relative(mdDir, fullPath).replace(/\\/g, "/");
+
+    const timeStr = new Date(timestamp).toLocaleString("zh-CN");
+    const mdContent = `\n## ${timeStr} [快照]\n\n![窗口快照](${relPath})\n`;
+
+    if (!fs.existsSync(mdFilePath)) {
+      fs.writeFileSync(mdFilePath, "# OCR Capture Log\n", "utf-8");
+    }
+    fs.appendFileSync(mdFilePath, mdContent, "utf-8");
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("snapshot-saved", {
+        path: fullPath,
+        relativePath: relPath,
+        timestamp,
+        nextSnapshot: getNextSnapshotTime(),
+      });
+    }
+
+    return fullPath;
+  } catch (err) {
+    console.error("Failed to save snapshot:", err);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("ocr-error", { message: `保存快照失败: ${err.message}` });
+    }
+    return null;
+  }
+}
+
 function startWorker(windowHandle) {
   if (workerProcess) {
     try {
@@ -46,6 +132,7 @@ function startWorker(windowHandle) {
     workerProcess = null;
   }
 
+  lastOcrText = "";
   workerProcess = fork(path.join(__dirname, "worker.js"));
   currentWindowHandle = windowHandle;
 
@@ -54,7 +141,7 @@ function startWorker(windowHandle) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("ocr-result", msg.data);
       }
-      appendToMarkdown(msg.data.text);
+      appendToMarkdown(msg.data.fullText || msg.data.text, msg.data.timestamp);
     } else if (msg.type === "screenshot-preview") {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("screenshot-preview", msg.data);
@@ -66,6 +153,15 @@ function startWorker(windowHandle) {
     } else if (msg.type === "status-change") {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("status-change", msg.data);
+      }
+    } else if (msg.type === "snapshot-data") {
+      const savedPath = saveSnapshot(msg.data.buffer, msg.data.timestamp);
+      if (savedPath && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("md-updated", mdFilePath);
+      }
+    } else if (msg.type === "snapshot-failed") {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("ocr-error", msg.data);
       }
     }
   });
@@ -92,6 +188,7 @@ function startWorker(windowHandle) {
 
   workerProcess.send({ type: "start", windowHandle });
   isCapturing = true;
+  startSnapshotTimer();
 }
 
 function handleWorkerCrash() {
@@ -103,7 +200,7 @@ function handleWorkerCrash() {
 
   if (restartCount >= MAX_RESTART_ATTEMPTS) {
     console.error("Max restart attempts reached, stopping capture");
-    isCapturing = false;
+    stopCapture();
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("ocr-error", { message: "子进程连续崩溃，已停止捕获，请重启应用" });
       mainWindow.webContents.send("status-change", { status: "stopped", message: "子进程崩溃，已停止" });
@@ -131,6 +228,8 @@ function handleWorkerCrash() {
 function stopCapture() {
   isCapturing = false;
   currentWindowHandle = null;
+  lastOcrText = "";
+  stopSnapshotTimer();
 
   if (restartTimer) {
     clearTimeout(restartTimer);
@@ -165,7 +264,7 @@ function stopCapture() {
   lastRestartTime = 0;
 }
 
-function appendToMarkdown(text) {
+function appendToMarkdown(text, timestamp) {
   if (!text || typeof text !== "string") return;
 
   const trimmed = text.trim();
@@ -173,8 +272,18 @@ function appendToMarkdown(text) {
 
   if (trimmed.replace(/\s+/g, "").length < 2) return;
 
-  const timestamp = new Date().toLocaleString("zh-CN");
-  const content = `\n## ${timestamp}\n\n${trimmed}\n`;
+  const diffResult = diffLines(lastOcrText, trimmed);
+
+  if (!diffResult.changed) {
+    return;
+  }
+
+  const diffContent = formatDiffForMarkdown(diffResult);
+  if (!diffContent) return;
+
+  const timeStr = new Date(timestamp || Date.now()).toLocaleString("zh-CN");
+  const header = `\n## ${timeStr}\n\n`;
+  const content = header + diffContent + "\n";
 
   try {
     if (!fs.existsSync(mdFilePath)) {
@@ -182,8 +291,15 @@ function appendToMarkdown(text) {
     }
     fs.appendFileSync(mdFilePath, content, "utf-8");
 
+    lastOcrText = trimmed;
+
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("md-updated", mdFilePath);
+      mainWindow.webContents.send("diff-result", {
+        added: diffResult.added,
+        removed: diffResult.removed,
+        diff: diffResult.diff,
+      });
     }
   } catch (err) {
     console.error("Failed to write markdown:", err);
@@ -209,8 +325,9 @@ ipcMain.handle("get-windows", async () => {
 ipcMain.handle("start-capture", async (event, windowHandle) => {
   restartCount = 0;
   lastRestartTime = 0;
+  lastOcrText = "";
   startWorker(windowHandle);
-  return { success: true };
+  return { success: true, nextSnapshot: getNextSnapshotTime() };
 });
 
 ipcMain.handle("stop-capture", async () => {
@@ -236,6 +353,10 @@ ipcMain.handle("get-md-content", async () => {
   } catch {
     return "";
   }
+});
+
+ipcMain.handle("get-next-snapshot", async () => {
+  return getNextSnapshotTime();
 });
 
 app.whenReady().then(createWindow);

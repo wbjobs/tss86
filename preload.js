@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("api", {
   getMdPath: () => ipcRenderer.invoke("get-md-path"),
   setMdPath: (path) => ipcRenderer.invoke("set-md-path", path),
   getMdContent: () => ipcRenderer.invoke("get-md-content"),
+  getNextSnapshot: () => ipcRenderer.invoke("get-next-snapshot"),
 
   onOcrResult: (callback) => {
     const handler = (event, data) => callback(data);
@@ -32,5 +33,15 @@ contextBridge.exposeInMainWorld("api", {
     const handler = (event, data) => callback(data);
     ipcRenderer.on("status-change", handler);
     return () => ipcRenderer.removeListener("status-change", handler);
+  },
+  onDiffResult: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on("diff-result", handler);
+    return () => ipcRenderer.removeListener("diff-result", handler);
+  },
+  onSnapshotSaved: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on("snapshot-saved", handler);
+    return () => ipcRenderer.removeListener("snapshot-saved", handler);
   },
 });

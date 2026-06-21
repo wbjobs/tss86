@@ -45,6 +45,49 @@ function sendStatus(status, message) {
   }
 }
 
+async function takeSnapshot() {
+  try {
+    const winStatus = await getWindowStatus(windowHandle);
+    if (!winStatus.visible || winStatus.minimized || !winStatus.bounds) {
+      return null;
+    }
+
+    const bounds = winStatus.bounds;
+    const displays = await screenshot.listDisplays();
+    const primaryDisplay = displays[0];
+
+    const imgBuffer = await screenshot({ screen: primaryDisplay.id });
+    const image = sharp(imgBuffer);
+
+    const metadata = await image.metadata();
+    const scaleX = metadata.width / primaryDisplay.width;
+    const scaleY = metadata.height / primaryDisplay.height;
+
+    const cropRegion = {
+      left: Math.max(0, Math.round(bounds.x * scaleX)),
+      top: Math.max(0, Math.round(bounds.y * scaleY)),
+      width: Math.max(1, Math.round(bounds.width * scaleX)),
+      height: Math.max(1, Math.round(bounds.height * scaleY)),
+    };
+
+    if (cropRegion.left + cropRegion.width > metadata.width) {
+      cropRegion.width = metadata.width - cropRegion.left;
+    }
+    if (cropRegion.top + cropRegion.height > metadata.height) {
+      cropRegion.height = metadata.height - cropRegion.top;
+    }
+
+    if (cropRegion.width <= 0 || cropRegion.height <= 0) {
+      return null;
+    }
+
+    const croppedBuffer = await image.extract(cropRegion).png().toBuffer();
+    return croppedBuffer;
+  } catch {
+    return null;
+  }
+}
+
 async function captureAndOcr() {
   if (!capturing) return;
 
@@ -140,6 +183,7 @@ async function captureAndOcr() {
       type: "ocr-result",
       data: {
         text,
+        fullText: text,
         confidence: result.data.confidence,
         timestamp: Date.now(),
       },
@@ -188,6 +232,16 @@ process.on("message", async (msg) => {
       worker = null;
     }
     process.exit(0);
+  } else if (msg.type === "snapshot") {
+    const buffer = await takeSnapshot();
+    if (buffer) {
+      process.send({
+        type: "snapshot-data",
+        data: { buffer: buffer.toString("base64"), timestamp: Date.now() },
+      });
+    } else {
+      process.send({ type: "snapshot-failed", data: { message: "无法获取快照" } });
+    }
   }
 });
 
