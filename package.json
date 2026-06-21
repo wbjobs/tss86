@@ -1,0 +1,17 @@
+{
+  "name": "window-ocr-capture",
+  "version": "1.0.0",
+  "description": "实时捕获窗口内容并OCR识别文字的桌面应用",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "screenshot-desktop": "^1.15.0",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^6.0.1"
+  },
+  "devDependencies": {
+    "electron": "^35.1.5"
+  }
+}
