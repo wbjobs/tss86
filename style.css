@@ -191,6 +191,11 @@ body {
   background: var(--danger);
 }
 
+.status-dot.warning {
+  background: var(--warning);
+  animation: pulse 1.5s infinite;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }

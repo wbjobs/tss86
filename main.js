@@ -4,9 +4,16 @@ const fs = require("fs");
 const { fork } = require("child_process");
 const { getWindows } = require("./window-utils");
 
+const MAX_RESTART_ATTEMPTS = 5;
+const RESET_RESTART_DELAY = 30000;
+
 let mainWindow = null;
 let workerProcess = null;
 let isCapturing = false;
+let currentWindowHandle = null;
+let restartCount = 0;
+let lastRestartTime = 0;
+let restartTimer = null;
 let mdFilePath = path.join(app.getPath("desktop"), "ocr-output.md");
 
 function createWindow() {
@@ -33,10 +40,14 @@ function createWindow() {
 
 function startWorker(windowHandle) {
   if (workerProcess) {
-    workerProcess.kill();
+    try {
+      workerProcess.kill();
+    } catch {}
+    workerProcess = null;
   }
 
   workerProcess = fork(path.join(__dirname, "worker.js"));
+  currentWindowHandle = windowHandle;
 
   workerProcess.on("message", (msg) => {
     if (msg.type === "ocr-result") {
@@ -52,38 +63,118 @@ function startWorker(windowHandle) {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("ocr-error", msg.data);
       }
+    } else if (msg.type === "status-change") {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("status-change", msg.data);
+      }
     }
   });
 
-  workerProcess.on("exit", (code) => {
-    if (isCapturing && code !== 0) {
-      console.error("Worker exited unexpectedly, code:", code);
+  workerProcess.on("error", (err) => {
+    console.error("Worker error:", err);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("ocr-error", { message: `Worker错误: ${err.message}` });
     }
+  });
+
+  workerProcess.on("exit", (code, signal) => {
     workerProcess = null;
+
+    if (isCapturing && code !== 0 && code !== null) {
+      console.error(`Worker exited unexpectedly, code: ${code}, signal: ${signal}, restart attempts: ${restartCount + 1}`);
+      handleWorkerCrash();
+    } else if (!isCapturing) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send("status-change", { status: "stopped", message: "已停止" });
+      }
+    }
   });
 
   workerProcess.send({ type: "start", windowHandle });
   isCapturing = true;
 }
 
+function handleWorkerCrash() {
+  const now = Date.now();
+
+  if (now - lastRestartTime > RESET_RESTART_DELAY) {
+    restartCount = 0;
+  }
+
+  if (restartCount >= MAX_RESTART_ATTEMPTS) {
+    console.error("Max restart attempts reached, stopping capture");
+    isCapturing = false;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("ocr-error", { message: "子进程连续崩溃，已停止捕获，请重启应用" });
+      mainWindow.webContents.send("status-change", { status: "stopped", message: "子进程崩溃，已停止" });
+    }
+    return;
+  }
+
+  restartCount++;
+  lastRestartTime = now;
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("status-change", {
+      status: "restarting",
+      message: `子进程崩溃，正在重启 (${restartCount}/${MAX_RESTART_ATTEMPTS})`,
+    });
+  }
+
+  restartTimer = setTimeout(() => {
+    if (isCapturing && currentWindowHandle) {
+      startWorker(currentWindowHandle);
+    }
+  }, 2000);
+}
+
 function stopCapture() {
   isCapturing = false;
-  if (workerProcess) {
-    workerProcess.send({ type: "stop" });
-    setTimeout(() => {
-      if (workerProcess) {
-        workerProcess.kill();
-        workerProcess = null;
-      }
-    }, 2000);
+  currentWindowHandle = null;
+
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
   }
+
+  if (workerProcess) {
+    try {
+      workerProcess.send({ type: "stop" });
+      const killTimer = setTimeout(() => {
+        if (workerProcess) {
+          try {
+            workerProcess.kill();
+          } catch {}
+          workerProcess = null;
+        }
+      }, 2000);
+
+      workerProcess.once("exit", () => {
+        clearTimeout(killTimer);
+        workerProcess = null;
+      });
+    } catch {
+      try {
+        workerProcess.kill();
+      } catch {}
+      workerProcess = null;
+    }
+  }
+
+  restartCount = 0;
+  lastRestartTime = 0;
 }
 
 function appendToMarkdown(text) {
-  if (!text || !text.trim()) return;
+  if (!text || typeof text !== "string") return;
+
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 2) return;
+
+  if (trimmed.replace(/\s+/g, "").length < 2) return;
 
   const timestamp = new Date().toLocaleString("zh-CN");
-  const content = `\n## ${timestamp}\n\n${text.trim()}\n`;
+  const content = `\n## ${timestamp}\n\n${trimmed}\n`;
 
   try {
     if (!fs.existsSync(mdFilePath)) {
@@ -116,6 +207,8 @@ ipcMain.handle("get-windows", async () => {
 });
 
 ipcMain.handle("start-capture", async (event, windowHandle) => {
+  restartCount = 0;
+  lastRestartTime = 0;
   startWorker(windowHandle);
   return { success: true };
 });

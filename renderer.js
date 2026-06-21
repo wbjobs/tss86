@@ -2,6 +2,19 @@ let selectedWindowHandle = null;
 let isCapturing = false;
 let captureCount = 0;
 let startTime = 0;
+let currentStatus = "stopped";
+
+const STATUS_CONFIG = {
+  stopped: { dotClass: "", text: "未启动", showPreview: false },
+  capturing: { dotClass: "running", text: "正在捕获", showPreview: true },
+  idle: { dotClass: "running", text: "文字无变化", showPreview: true },
+  no_text: { dotClass: "warning", text: "未检测到文字", showPreview: true },
+  occluded: { dotClass: "warning", text: "窗口被遮挡或空白", showPreview: false },
+  minimized: { dotClass: "warning", text: "窗口已最小化", showPreview: false },
+  invisible: { dotClass: "error", text: "窗口不可见", showPreview: false },
+  restarting: { dotClass: "warning", text: "子进程重启中", showPreview: false },
+  error: { dotClass: "error", text: "错误", showPreview: false },
+};
 
 const btnRefresh = document.getElementById("btn-refresh");
 const btnStart = document.getElementById("btn-start");
@@ -67,12 +80,39 @@ async function loadMdPath() {
   mdPathEl.textContent = path;
 }
 
-function setStatus(running, text) {
-  isCapturing = running;
-  statusDot.className = running ? "status-dot running" : "status-dot";
-  statusText.textContent = text;
-  btnStart.disabled = running || !selectedWindowHandle;
-  btnStop.disabled = !running;
+function updateStatus(status, customText) {
+  currentStatus = status;
+  const config = STATUS_CONFIG[status] || STATUS_CONFIG.error;
+
+  statusDot.className = `status-dot ${config.dotClass}`;
+  statusText.textContent = customText || config.text;
+
+  btnStart.disabled = isCapturing || !selectedWindowHandle;
+  btnStop.disabled = !isCapturing;
+
+  if (!config.showPreview && isCapturing) {
+    if (!previewContainer.querySelector(".placeholder")) {
+      previewContainer.innerHTML = `
+        <div class="placeholder">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/>
+            <line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          <p>${customText || config.text}</p>
+        </div>
+      `;
+    } else {
+      previewContainer.querySelector(".placeholder p").textContent = customText || config.text;
+    }
+  }
+}
+
+function setCapturingState(capturing) {
+  isCapturing = capturing;
+  if (!capturing) {
+    updateStatus("stopped");
+  }
 }
 
 function addOcrEntry(data) {
@@ -118,16 +158,18 @@ btnStart.addEventListener("click", async () => {
 
   captureCount = 0;
   startTime = Date.now();
-  textContainer.innerHTML = "";
+  textContainer.innerHTML = '<div class="placeholder"><svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg><p>等待 OCR 识别结果...</p></div>';
   captureFps.textContent = "";
+  ocrStats.innerHTML = "";
 
-  setStatus(true, "正在捕获...");
+  setCapturingState(true);
+  updateStatus("capturing", "正在捕获...");
   await window.api.startCapture(selectedWindowHandle);
 });
 
 btnStop.addEventListener("click", async () => {
   await window.api.stopCapture();
-  setStatus(false, "已停止");
+  setCapturingState(false);
   startTime = 0;
   captureFps.textContent = "";
 });
@@ -175,14 +217,16 @@ window.api.onScreenshotPreview((data) => {
 });
 
 window.api.onOcrError((data) => {
-  statusDot.classList.add("error");
-  statusText.textContent = `错误: ${data.message}`;
+  updateStatus("error", data.message);
   setTimeout(() => {
-    if (isCapturing) {
-      statusDot.classList.remove("error");
-      statusText.textContent = "正在捕获...";
+    if (isCapturing && currentStatus === "error") {
+      updateStatus("capturing");
     }
   }, 3000);
+});
+
+window.api.onStatusChange((data) => {
+  updateStatus(data.status, data.message);
 });
 
 window.api.onMdUpdated((path) => {

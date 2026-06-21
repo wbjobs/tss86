@@ -61,4 +61,35 @@ async function getWindowBounds(handle) {
   }
 }
 
-module.exports = { getWindows, getWindowBounds };
+async function getWindowStatus(handle) {
+  try {
+    const output = await execPs(path.join(SCRIPTS_DIR, "get-window-status.ps1"), [String(handle)]);
+    if (output === "invisible") {
+      return { visible: false, minimized: false, bounds: null };
+    }
+    if (output === "minimized") {
+      return { visible: true, minimized: true, bounds: null };
+    }
+    const parts = output.split("|");
+    if (parts[0] === "ok" && parts[1]) {
+      const coords = parts[1].split(",").map(Number);
+      if (coords.length === 4 && !coords.some(isNaN)) {
+        return {
+          visible: true,
+          minimized: false,
+          bounds: {
+            x: coords[0],
+            y: coords[1],
+            width: coords[2] - coords[0],
+            height: coords[3] - coords[1],
+          },
+        };
+      }
+    }
+    return { visible: false, minimized: false, bounds: null };
+  } catch {
+    return { visible: false, minimized: false, bounds: null };
+  }
+}
+
+module.exports = { getWindows, getWindowBounds, getWindowStatus };

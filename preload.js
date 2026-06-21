@@ -28,4 +28,9 @@ contextBridge.exposeInMainWorld("api", {
     ipcRenderer.on("md-updated", handler);
     return () => ipcRenderer.removeListener("md-updated", handler);
   },
+  onStatusChange: (callback) => {
+    const handler = (event, data) => callback(data);
+    ipcRenderer.on("status-change", handler);
+    return () => ipcRenderer.removeListener("status-change", handler);
+  },
 });
